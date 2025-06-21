@@ -1,0 +1,1666 @@
+<?php
+// Start session and set error reporting
+session_start();
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Initialize variables
+$pdo = null;
+$error_message = '';
+$success_message = '';
+
+// Check if user is logged in
+if (!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+
+// Include database configuration
+try {
+    require_once 'config/database.php';
+    
+    // Verify database connection
+    if (!isset($pdo) || !($pdo instanceof PDO)) {
+        throw new Exception('Database connection could not be established');
+    }
+    
+    // Test the connection
+    $pdo->query('SELECT 1');
+    
+} catch (PDOException $e) {
+    $error_message = 'Database connection failed: ' . $e->getMessage();
+    error_log($error_message);
+    die('Database connection error. Please try again later.');
+} catch (Exception $e) {
+    $error_message = 'Error: ' . $e->getMessage();
+    error_log($error_message);
+    die('An error occurred. Please try again later.');
+}
+
+/**
+ * Calculate working days between two dates (excluding weekends)
+ * 
+ * @param string $startDate Start date in Y-m-d format
+ * @param string $endDate End date in Y-m-d format
+ * @return int Number of working days between the dates (inclusive)
+ */
+function calculateWorkingDays($startDate, $endDate) {
+    try {
+        // Validate input dates
+        if (empty($startDate) || empty($endDate)) {
+            throw new InvalidArgumentException('Start date and end date are required');
+        }
+        
+        // Create DateTime objects
+        $start = new DateTime($startDate);
+        $end = new DateTime($endDate);
+        
+        // Ensure start date is before or equal to end date
+        if ($start > $end) {
+            // Swap dates if start is after end
+            list($start, $end) = array($end, $start);
+        }
+        
+        // Include the end date in the calculation
+        $end = clone $end;
+        $end->modify('+1 day');
+        
+        // Calculate the difference in days
+        $interval = new DateInterval('P1D');
+        $period = new DatePeriod($start, $interval, $end);
+        
+        $workingDays = 0;
+        
+        // Count working days (Monday to Friday)
+        foreach ($period as $date) {
+            $dayOfWeek = (int)$date->format('N'); // 1 (Monday) to 7 (Sunday)
+            if ($dayOfWeek < 6) { // 1-5 = Monday to Friday
+                $workingDays++;
+            }
+        }
+        
+        return $workingDays;
+        
+    } catch (Exception $e) {
+        error_log('Error in calculateWorkingDays: ' . $e->getMessage() . 
+                 ' (Start: ' . ($startDate ?? 'null') . 
+                 ', End: ' . ($endDate ?? 'null') . ')'
+        );
+        return 0;
+    }
+}
+
+// Handle form submissions
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        // Validate session and database connection
+        if (!isset($_SESSION['user_id'])) {
+            throw new Exception('User not authenticated');
+        }
+        
+        if (!isset($pdo)) {
+            throw new Exception('Database connection not established');
+        }
+        
+        $user_id = $_SESSION['user_id'];
+        
+        // Handle offset request form submission
+        if (isset($_POST['offset_submit'])) {
+            // Validate and sanitize input
+            $activity_id = isset($_POST['offset_activity']) ? (int)$_POST['offset_activity'] : 0;
+            $offset_date = isset($_POST['offset_date']) ? trim($_POST['offset_date']) : '';
+            $reason = isset($_POST['offset_reason']) ? trim(strip_tags($_POST['offset_reason'])) : '';
+            
+            // Input validation
+            if (!$activity_id) {
+                throw new Exception('Please select a valid activity');
+            }
+            
+            if (empty($offset_date)) {
+                throw new Exception('Offset date is required');
+            }
+            
+            if (empty($reason)) {
+                throw new Exception('Please provide a reason for the offset request');
+            }
+            
+            // Verify activity exists and belongs to user
+            $activity_stmt = $pdo->prepare("SELECT id FROM activities WHERE id = ? AND user_id = ?");
+            $activity_stmt->execute([$activity_id, $user_id]);
+            
+            if (!$activity_stmt->fetch()) {
+                throw new Exception('Invalid activity selected');
+            }
+            
+            // Insert the offset request
+            $stmt = $pdo->prepare("
+                INSERT INTO offset_requests 
+                (user_id, activity_id, offset_date, reason) 
+                VALUES (?, ?, ?, ?)
+            ");
+            
+            $success = $stmt->execute([
+                $user_id,
+                $activity_id,
+                $offset_date,
+                $reason
+            ]);
+            
+            if (!$success) {
+                throw new Exception('Failed to save offset request');
+            }
+            
+            $_SESSION['success_message'] = 'Offset request submitted successfully!';
+        } 
+        // Handle overtime form submission
+        elseif (isset($_POST['overtime_submit'])) {
+            // Validate input
+            $activity_id = filter_input(INPUT_POST, 'activity_id', FILTER_VALIDATE_INT);
+            
+            if (!$activity_id) {
+                throw new Exception('Please select an activity');
+            }
+            
+            // Get the activity's date range
+            $activity_stmt = $pdo->prepare("SELECT start_date, end_date FROM activities WHERE id = ? AND user_id = ?");
+            $activity_stmt->execute([$activity_id, $user_id]);
+            $activity = $activity_stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$activity || empty($activity['start_date']) || empty($activity['end_date'])) {
+                throw new Exception('Could not find the selected activity or it has no valid date range');
+            }
+            
+            // Insert the new overtime request
+            $stmt = $pdo->prepare("
+                INSERT INTO overtime_requests 
+                (user_id, activity_id, start_date, end_date, status) 
+                VALUES (?, ?, ?, ?, 'pending')
+            ");
+            
+            $success = $stmt->execute([
+                $user_id,
+                $activity_id,
+                $activity['start_date'],
+                $activity['end_date']
+            ]);
+            
+            if (!$success) {
+                throw new Exception('Failed to save overtime request');
+            }
+            
+            $_SESSION['success_message'] = 'Overtime request submitted successfully!';
+        }
+        
+    } catch (Exception $e) {
+        $_SESSION['error_message'] = $e->getMessage();
+        error_log('Form submission error: ' . $e->getMessage());
+    }
+    
+    // Redirect back to the same page
+    header('Location: ' . $_SERVER['PHP_SELF']);
+    exit();
+}
+
+// Initialize default values
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) {
+    error_log("User ID not found in session");
+    header("Location: index.php");
+    exit();
+}
+
+// Initialize variables
+$remaining_offset = 0;
+$remaining_overtime = 0;
+$pending_requests = 0;
+$used_offsets = 0;
+$activities = [];
+$offset_requests = [];
+$overtime_requests = [];
+
+// Get success/error messages from session and clear them
+$success_message = $_SESSION['success_message'] ?? '';
+$error_message = $_SESSION['error_message'] ?? '';
+unset($_SESSION['success_message'], $_SESSION['error_message']);
+
+try {
+    // Start transaction for multiple queries
+    $pdo->beginTransaction();
+    
+    // Create tables if they don't exist
+    $pdo->exec("CREATE TABLE IF NOT EXISTS offset_requests (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        activity_id INT NOT NULL,
+        offset_date DATE NOT NULL,
+        reason TEXT NOT NULL,
+        status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+    )");
+    
+    $pdo->exec("CREATE TABLE IF NOT EXISTS overtime_requests (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        activity_id INT NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+    )");
+    
+    // Fetch activities for dropdowns
+    $stmt = $pdo->prepare("SELECT id, title, start_date, end_date FROM activities WHERE user_id = ?");
+    $stmt->execute([$user_id]);
+    $activities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Fetch offset requests
+    $stmt = $pdo->prepare("
+        SELECT o.*, a.title as activity_title
+        FROM offset_requests o
+        JOIN activities a ON o.activity_id = a.id
+        WHERE o.user_id = ?
+        ORDER BY o.created_at DESC
+    ");
+    $stmt->execute([$user_id]);
+    $offset_requests = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Fetch overtime requests
+    $stmt = $pdo->prepare("
+        SELECT orq.*, a.title as activity_title
+        FROM overtime_requests orq
+        JOIN activities a ON orq.activity_id = a.id
+        WHERE orq.user_id = ?
+        ORDER BY orq.created_at DESC
+    ");
+    $stmt->execute([$user_id]);
+    $overtime_requests = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Calculate remaining offsets and pending requests
+    $stmt = $pdo->prepare("
+        SELECT 
+            COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) as approved_offsets,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending_offsets
+        FROM offset_requests 
+        WHERE user_id = ?
+    ");
+    $stmt->execute([$user_id]);
+    $offset_stats = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    $remaining_offset = $offset_stats['approved_offsets'] ?? 0;
+    $pending_requests = $offset_stats['pending_offsets'] ?? 0;
+    
+    // Calculate used offsets
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) as used_offsets 
+        FROM offset_requests 
+        WHERE user_id = ? AND status = 'approved' AND used = 1
+    ");
+    $stmt->execute([$user_id]);
+    $used_result = $stmt->fetch(PDO::FETCH_ASSOC);
+    $used_offsets = $used_result['used_offsets'] ?? 0;
+    
+    // Calculate remaining overtime
+    $stmt = $pdo->prepare("
+        SELECT COALESCE(SUM(hours), 0) as total_overtime 
+        FROM overtime_requests 
+        WHERE user_id = ? AND status = 'approved' AND (offset_used = 0 OR offset_used IS NULL)
+    ");
+    $stmt->execute([$user_id]);
+    $overtime_result = $stmt->fetch(PDO::FETCH_ASSOC);
+    $remaining_overtime = $overtime_result['total_overtime'] ?? 0;
+    
+    // Get pending overtime requests
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) as pending_overtime 
+        FROM overtime_requests 
+        WHERE user_id = ? AND status = 'pending'
+    ");
+    $stmt->execute([$user_id]);
+    $pending_overtime = $stmt->fetch(PDO::FETCH_ASSOC);
+    $pending_requests += $pending_overtime['pending_overtime'] ?? 0;
+    
+    $pdo->commit();
+    
+} catch (PDOException $e) {
+    $pdo->rollBack();
+    $_SESSION['error_message'] = 'Database error: ' . $e->getMessage();
+    error_log('Database error: ' . $e->getMessage());
+}
+
+// Handle form submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['overtime_submit'])) {
+    try {
+        // Validate input
+        $activity_id = filter_input(INPUT_POST, 'activity_id', FILTER_VALIDATE_INT);
+        $overtime_date = date('Y-m-d'); // Use current date
+        
+        if (!$activity_id) {
+            throw new Exception('Please select an activity');
+        }
+        
+        // Check if table exists, create if it doesn't
+        $table_check = $pdo->query("SHOW TABLES LIKE 'overtime_requests'");
+        if ($table_check->rowCount() == 0) {
+            $pdo->exec("CREATE TABLE overtime_requests (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                activity_id INT NOT NULL,
+                start_date DATE NOT NULL,
+                end_date DATE NOT NULL,
+                status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+            )");
+        }
+        
+        // Get the activity's date range
+        $activity_stmt = $pdo->prepare("SELECT start_date, end_date FROM activities WHERE id = ?");
+        $activity_stmt->execute([$activity_id]);
+        $activity = $activity_stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$activity || empty($activity['start_date']) || empty($activity['end_date'])) {
+            throw new Exception('Could not find the selected activity or it has no valid date range');
+        }
+        
+        // Insert the new overtime request with the activity's date range
+        $stmt = $pdo->prepare("INSERT INTO overtime_requests 
+                             (user_id, activity_id, start_date, end_date, status) 
+                             VALUES (?, ?, ?, ?, 'pending')");
+        $stmt->execute([
+            $user_id, 
+            $activity_id, 
+            $activity['start_date'], 
+            $activity['end_date']
+        ]);
+        
+        // Set success message in session and redirect to prevent form resubmission
+        $_SESSION['success_message'] = 'Overtime request submitted successfully!';
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit();
+        
+    } catch (Exception $e) {
+        $_SESSION['error_message'] = 'Error: ' . $e->getMessage();
+        error_log('Overtime submission error: ' . $e->getMessage());
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit();
+    }
+}
+
+// Initialize empty arrays
+$activities = [];
+$overtime_requests = [];
+
+// First, check if the tables exist
+try {
+    // Check if offset_requests table exists
+    $table_check = $pdo->query("SHOW TABLES LIKE 'offset_requests'");
+    $offset_table_exists = $table_check->rowCount() > 0;
+    
+    // Check if overtime_requests table exists
+    $table_check = $pdo->query("SHOW TABLES LIKE 'overtime_requests'");
+    $overtime_table_exists = $table_check->rowCount() > 0;
+    
+    if ($overtime_table_exists) {
+        // Fetch all activities for the overtime request form
+        $activities_query = $pdo->prepare("
+            SELECT id, title, start_date, end_date
+            FROM activities 
+            WHERE status = 'Completed' 
+            ORDER BY start_date DESC, updated_at DESC
+        ");
+        $activities_query->execute();
+        $activities = $activities_query->fetchAll(PDO::FETCH_ASSOC);
+
+        // Fetch activities with overtime requests for the offset form
+        $overtime_activities_query = $pdo->prepare("
+            SELECT DISTINCT a.id, a.title, a.start_date, a.end_date
+            FROM activities a
+            INNER JOIN overtime_requests orq ON a.id = orq.activity_id
+            WHERE a.status = 'Completed' 
+            AND orq.user_id = ?
+            ORDER BY a.start_date DESC, a.updated_at DESC
+        ");
+        $overtime_activities_query->execute([$user_id]);
+        $overtime_activities = $overtime_activities_query->fetchAll(PDO::FETCH_ASSOC);
+        
+        // Simplified query without the problematic columns
+        $overtime_query = $pdo->prepare("
+            SELECT 
+                orq.*, 
+                a.title as activity_title, 
+                a.start_date as activity_start, 
+                a.end_date as activity_end,
+                0 as used_days  -- Default value for used_days
+            FROM overtime_requests orq
+            LEFT JOIN activities a ON orq.activity_id = a.id
+            WHERE orq.user_id = ?
+            ORDER BY a.start_date DESC, orq.created_at DESC
+        ");
+        $overtime_query->execute([$user_id]);
+        $overtime_requests = $overtime_query->fetchAll(PDO::FETCH_ASSOC);
+    }
+} catch (PDOException $e) {
+    error_log("Error fetching data: " . $e->getMessage());
+    // Continue with empty arrays if there's an error
+}
+
+try {
+    // Check if offset_requests table exists
+    $table_check = $pdo->query("SHOW TABLES LIKE 'offset_requests'");
+    $overtime_table_check = $pdo->query("SHOW TABLES LIKE 'overtime_requests'");
+    
+    if ($table_check->rowCount() > 0) {
+        // Simplified remaining offset calculation
+        $remaining_offset = 0;  // Default value
+        
+        // Check if the columns exist before running the query
+        $columns_exist = true;
+        try {
+            $check_columns = $pdo->query("SHOW COLUMNS FROM offset_requests LIKE 'hours'");
+            if ($check_columns->rowCount() == 0) {
+                $columns_exist = false;
+            }
+            
+            if ($columns_exist) {
+                $offset_query = $pdo->prepare(
+                    "SELECT COALESCE(SUM(hours), 0) as total_offset 
+                     FROM offset_requests 
+                     WHERE user_id = ? AND status = 'approved' AND used = 0"
+                );
+                $offset_query->execute([$user_id]);
+                $result = $offset_query->fetch(PDO::FETCH_ASSOC);
+                $remaining_offset = $result ? $result['total_offset'] : 0;
+            }
+        } catch (PDOException $e) {
+            error_log("Error checking offset_requests columns: " . $e->getMessage());
+        }
+        
+        // Get used offsets count
+        $used_query = $pdo->prepare(
+            "SELECT COUNT(*) as total_used FROM offset_requests WHERE user_id = ? AND used = 1"
+        );
+        $used_query->execute([$user_id]);
+        $result = $used_query->fetch(PDO::FETCH_ASSOC);
+        $used_offsets = $result ? $result['total_used'] : 0;
+        
+        // Get pending offset requests
+        $pending_offset_query = $pdo->prepare(
+            "SELECT COUNT(*) as count FROM offset_requests WHERE user_id = ? AND status = 'pending'"
+        );
+        $pending_offset_query->execute([$user_id]);
+        $pending_offset = $pending_offset_query->fetch(PDO::FETCH_ASSOC);
+        $pending_requests = $pending_offset ? $pending_offset['count'] : 0;
+    }
+    
+    if ($overtime_table_check->rowCount() > 0) {
+        // Simplified remaining overtime calculation
+        $remaining_overtime = 0;  // Default value
+        
+        // Check if the columns exist before running the query
+        $columns_exist = true;
+        try {
+            $check_columns = $pdo->query("SHOW COLUMNS FROM overtime_requests LIKE 'hours'");
+            if ($check_columns->rowCount() == 0) {
+                $columns_exist = false;
+            }
+            
+            if ($columns_exist) {
+                $overtime_query = $pdo->prepare(
+                    "SELECT COALESCE(SUM(hours), 0) as total_overtime 
+                     FROM overtime_requests 
+                     WHERE user_id = ? AND status = 'approved' AND (offset_used = 0 OR offset_used IS NULL)"
+                );
+                $overtime_query->execute([$user_id]);
+                $result = $overtime_query->fetch(PDO::FETCH_ASSOC);
+                $remaining_overtime = $result ? $result['total_overtime'] : 0;
+            }
+        } catch (PDOException $e) {
+            error_log("Error checking overtime_requests columns: " . $e->getMessage());
+        }
+        
+        // Get pending overtime requests
+        $pending_overtime_query = $pdo->prepare(
+            "SELECT COUNT(*) as count FROM overtime_requests WHERE user_id = ? AND status = 'pending'"
+        );
+        $pending_overtime_query->execute([$user_id]);
+        $pending_overtime = $pending_overtime_query->fetch(PDO::FETCH_ASSOC);
+        $pending_requests += $pending_overtime ? $pending_overtime['count'] : 0;
+    }
+} catch (PDOException $e) {
+    // Log error but don't show to user
+    error_log("Error fetching offset/overtime data: " . $e->getMessage());
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DICT Project Monitoring System - Offset Status</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+    <link rel="stylesheet" href="assets/css/style.css">
+    <style>
+        :root {
+            --primary-bg: #0a192f;
+            --secondary-bg: rgba(16, 32, 56, 0.9);
+            --accent-color: #64ffda;
+            --accent-secondary: #7928ca;
+            --text-white: #ffffff;
+            --border-color: rgba(100, 255, 218, 0.1);
+        }
+        
+        body {
+            background-color: var(--primary-bg);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(100, 255, 218, 0.1) 0%, transparent 50%),
+                radial-gradient(at 100% 0%, rgba(121, 40, 202, 0.1) 0%, transparent 50%);
+            color: var(--text-white);
+            font-family: 'Space Grotesk', sans-serif;
+        }
+        
+        .main-content {
+            padding: 2rem;
+            transition: all 0.3s ease;
+            background: transparent;
+        }
+        
+        .welcome-text {
+            font-weight: 700;
+            color: var(--accent-color);
+            margin: 0;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .card {
+            background: var(--secondary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(10px);
+            transition: all 0.3s ease;
+            margin-bottom: 1.5rem;
+            overflow: hidden;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            border-color: var(--accent-color);
+        }
+        
+        .card-header {
+            background: rgba(16, 32, 56, 0.7);
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            padding: 1.25rem 1.5rem;
+            color: var(--accent-color);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 0.85rem;
+        }
+        
+        .table {
+            margin-bottom: 0;
+        }
+        
+        .table td {
+            color: #000000;
+        }
+        
+        .table th {
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.5px;
+            background: rgba(100, 255, 218, 0.05);
+            border-bottom: 1px solid var(--border-color);
+            color: var(--accent-color);
+            padding: 1rem 1.5rem;
+        }
+        
+        .table td {
+            padding: 1rem 1.5rem;
+            vertical-align: middle;
+            border-color: var(--border-color);
+            color: #000000;
+        }
+        
+        .table-hover tbody tr:hover {
+            background: rgba(100, 255, 218, 0.05);
+        }
+        
+        .badge {
+            font-weight: 500;
+            padding: 0.4em 0.8em;
+            font-size: 0.75rem;
+            border-radius: 20px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .bg-success {
+            background-color: rgba(40, 167, 69, 0.2) !important;
+            color: #28a745 !important;
+            border: 1px solid rgba(40, 167, 69, 0.3);
+        }
+        
+        .bg-warning {
+            background-color: rgba(255, 193, 7, 0.2) !important;
+            color: #ffc107 !important;
+            border: 1px solid rgba(255, 193, 7, 0.3);
+        }
+        
+        .btn-outline-primary {
+            color: var(--accent-color);
+            border-color: var(--accent-color);
+            transition: all 0.3s ease;
+        }
+        
+        .btn-outline-primary:hover {
+            background: var(--accent-color);
+            color: var(--primary-bg);
+            transform: translateY(-1px);
+        }
+        
+        /* Stats Card Styles */
+        .icon-shape {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 48px;
+            height: 48px;
+        }
+        
+        .border-4 {
+            border-width: 4px !important;
+        }
+        
+        .card {
+            border: none;
+            border-radius: 10px;
+            box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .card-body {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0; /* Allows the card body to shrink if needed */
+        }
+        
+        .table-responsive {
+            flex: 1;
+            min-height: 0; /* Allows the table to scroll */
+        }
+        
+        .card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15) !important;
+        }
+        
+        .avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background-color: var(--accent-secondary);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .table-container {
+            border-radius: 0 0 12px 12px;
+            overflow: hidden;
+        }
+        
+        .text-muted {
+            color: var(--text-muted) !important;
+        }
+        
+        /* Custom scrollbar for table container */
+        .table-responsive {
+            scrollbar-width: thin;
+            scrollbar-color: var(--accent-color) rgba(255, 255, 255, 0.1);
+        }
+        
+        .table-responsive::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        
+        .table-responsive::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+        }
+        
+        .table-responsive::-webkit-scrollbar-thumb {
+            background-color: var(--accent-color);
+            border-radius: 3px;
+        }
+        
+        .table-responsive::-webkit-scrollbar-thumb:hover {
+            background-color: #52d8b2;
+        }
+        
+        .table thead th {
+            position: sticky;
+            top: 0;
+            background: var(--secondary-bg);
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row h-100">
+            <!-- Include Sidebar -->
+            <?php include 'sidebar.php'; ?>
+            
+            <!-- Main Content -->
+            <div class="col-md-10 main-content animate__animated animate__fadeIn" style="margin-left: 350px;">
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <div>
+                        <h2 class="welcome-text"> Overtime and Offset Status</h2>
+                        <p class="text-muted mb-0">View and manage overtime and offset requests and status</p>
+                    </div>
+                    <div class="d-flex">
+                        <span class="text-muted small align-self-end me-2">
+                            <i class="bi bi-calendar3 me-1"></i>
+                            <?php echo date('F j, Y'); ?>
+                        </span>
+                    </div>
+                </div>
+
+                <!-- Stats Cards -->
+                <div class="row mb-4">
+                    <!-- Remaining Offset Hours -->
+                    <div class="col-md-3 mb-3 mb-md-0">
+                        <div class="card h-100 border-start border-4 border-success">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <h6 class="text-uppercase text-muted small mb-1">Remaining Offset</h6>
+                                        <h3 class="mb-0"><?php echo number_format($remaining_offset, 1); ?> <small class="text-muted">hours</small></h3>
+                                    </div>
+                                    <div class="icon-shape bg-success bg-opacity-10 text-success rounded-3 p-3">
+                                        <i class="bi bi-clock-history fs-4"></i>
+                                    </div>
+                                </div>
+                                <div class="mt-2">
+                                    <span class="text-success small"><i class="bi bi-arrow-up"></i> Available to use</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Remaining Overtime Hours -->
+                    <div class="col-md-3 mb-3 mb-md-0">
+                        <div class="card h-100 border-start border-4 border-primary">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <h6 class="text-uppercase text-muted small mb-1">Remaining Overtime</h6>
+                                        <h3 class="mb-0"><?php echo number_format($remaining_overtime, 1); ?> <small class="text-muted">hours</small></h3>
+                                    </div>
+                                    <div class="icon-shape bg-primary bg-opacity-10 text-primary rounded-3 p-3">
+                                        <i class="bi bi-stopwatch fs-4"></i>
+                                    </div>
+                                </div>
+                                <div class="mt-2">
+                                    <span class="text-primary small"><i class="bi bi-arrow-up"></i> Available to claim</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+
+                    <!-- Pending Requests -->
+                    <div class="col-md-3 mb-3 mb-md-0">
+                        <div class="card h-100 border-start border-4 border-warning">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <h6 class="text-uppercase text-muted small mb-1">Pending Requests</h6>
+                                        <h3 class="mb-0"><?php echo $pending_requests; ?> <small class="text-muted">requests</small></h3>
+                                    </div>
+                                    <div class="icon-shape bg-warning bg-opacity-10 text-warning rounded-3 p-3">
+                                        <i class="bi bi-hourglass-split fs-4"></i>
+                                    </div>
+                                </div>
+                                <div class="mt-2">
+                                    <span class="text-warning small"><i class="bi bi-arrow-up"></i> Awaiting approval</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+
+                    <!-- Used Offsets -->
+                    <div class="col-md-3">
+                        <div class="card h-100 border-start border-4 border-info">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <h6 class="text-uppercase text-muted small mb-1">Used Offsets</h6>
+                                        <h3 class="mb-0"><?php echo $used_offsets; ?> <small class="text-muted">times</small></h3>
+                                    </div>
+                                    <div class="icon-shape bg-info bg-opacity-10 text-info rounded-3 p-3">
+                                        <i class="bi bi-check-circle fs-4"></i>
+                                    </div>
+                                </div>
+                                <div class="mt-2">
+                                    <span class="text-info small"><i class="bi bi-check"></i> Successfully used</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Offset and Overtime Containers -->
+                <div class="row mb-4">
+                    <!-- Offset Container -->
+                    <div class="col-md-6 mb-3 mb-md-0">
+                        <div class="card h-100">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <div>
+                                    <h5 class="mb-0">Offset Details</h5>
+                                    <p class="small text-muted mb-0">Your approved and pending offset requests</p>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#addOffsetModal">
+                                    <i class="bi bi-plus-lg me-1"></i> Add Offset Request
+                                </button>
+                            </div>
+                            <div class="card-body p-0 d-flex flex-column" style="min-height: 400px;">
+                                <div class="table-responsive">
+                                    <table class="table table-hover mb-0">
+                                        <colgroup>
+                                            <col style="width: 35%;">
+                                            <col style="width: 20%;">
+                                            <col style="width: 20%;">
+                                            <col style="width: 25%;">
+                                        </colgroup>
+                                        <thead>
+                                            <tr>
+                                                <th>Activity</th>
+                                                <th class="text-center">Offset Date</th>
+                                                <th class="text-center">Status</th>
+                                                <th class="text-end">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <?php if (!empty($offset_requests)): ?>
+                                                <?php foreach ($offset_requests as $request): ?>
+                                                    <tr>
+                                                        <td>
+                                                            <div class="text-truncate" style="max-width: 250px;" title="<?php echo htmlspecialchars($request['activity_title'] ?? 'N/A'); ?>">
+                                                                <?php echo htmlspecialchars($request['activity_title'] ?? 'N/A'); ?>
+                                                            </div>
+                                                        </td>
+                                                        <td class="text-center">
+                                                            <?php echo date('M d, Y', strtotime($request['offset_date'])); ?>
+                                                        </td>
+                                                        <td class="text-center">
+                                                            <?php 
+                                                            $status_class = '';
+                                                            switch($request['status']) {
+                                                                case 'approved':
+                                                                    $status_class = 'bg-success';
+                                                                    break;
+                                                                case 'rejected':
+                                                                    $status_class = 'bg-danger';
+                                                                    break;
+                                                                default:
+                                                                    $status_class = 'bg-warning';
+                                                            }
+                                                            ?>
+                                                            <span class="badge <?php echo $status_class; ?> text-white">
+                                                                <?php echo ucfirst($request['status']); ?>
+                                                            </span>
+                                                        </td>
+                                                        <td class="text-end">
+                                                            <?php if ($request['status'] === 'pending'): ?>
+                                                                <button class="btn btn-sm btn-outline-danger delete-offset" 
+                                                                        data-id="<?php echo $request['id']; ?>"
+                                                                        data-bs-toggle="tooltip" 
+                                                                        title="Delete Request">
+                                                                    <i class="bi bi-trash"></i>
+                                                                </button>
+                                                            <?php endif; ?>
+                                                        </td>
+                                                    </tr>
+                                                <?php endforeach; ?>
+                                            <?php else: ?>
+                                                <tr>
+                                                    <td colspan="4" class="text-center py-4">
+                                                        <div class="text-muted">No offset requests found</div>
+                                                        <small class="d-block mt-1">Click the "Add Offset Request" button to create a new request</small>
+                                                    </td>
+                                                </tr>
+                                            <?php endif; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Overtime Container -->
+                    <div class="col-md-6">
+                        <div class="card h-100">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <div>
+                                    <h5 class="mb-0">Overtime Details</h5>
+                                    <p class="small text-muted mb-0">Your approved and pending overtime requests</p>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#addOvertimeModal">
+                                    <i class="bi bi-plus-lg me-1"></i> Add Overtime Details
+                                </button>
+                            </div>
+                            <div class="card-body p-0 d-flex flex-column" style="min-height: 400px;">
+                                <div class="table-responsive flex-grow-1" style="overflow-y: auto;">
+                                    <table class="table table-hover mb-0">
+                                        <colgroup>
+                                            <col style="width: 40%;">
+                                            <col style="width: 15%;">
+                                            <col style="width: 15%;">
+                                            <col style="width: 15%;">
+                                            <col style="width: 15%;">
+                                        </colgroup>
+                                        <thead>
+                                            <tr>
+                                                <th width="40%">Activity</th>
+                                                <th width="15%" class="text-center">Days</th>
+                                                <th width="15%" class="text-center">Status</th>
+                                                <th width="15%" class="text-center">Used</th>
+                                                <th width="15%" class="text-end">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+<?php 
+if (!empty($overtime_requests)): 
+    foreach ($overtime_requests as $request): 
+        $status_class = '';
+        if ($request['status'] === 'approved') {
+            $status_class = 'bg-success';
+        } elseif ($request['status'] === 'rejected') {
+            $status_class = 'bg-danger';
+        } else {
+            $status_class = 'bg-warning';
+        }
+        
+        $total_days = calculateWorkingDays($request['activity_start'], $request['activity_end']);
+        $used_days = $request['used_days'] ?? 0;
+        $available_days = max(0, $total_days - $used_days);
+?>
+        <tr>
+            <td>
+                <div class="text-truncate" style="max-width: 250px;" title="<?php echo htmlspecialchars($request['activity_title'] ?? 'N/A'); ?>">
+                    <?php echo htmlspecialchars($request['activity_title'] ?? 'N/A'); ?>
+                </div>
+            </td>
+            <td class="text-center">
+                <?php echo number_format($total_days, 1); ?>
+            </td>
+            <td class="text-center">
+                <?php 
+                $usage_percentage = ($used_days / $total_days) * 100;
+                $status_text = ($usage_percentage >= 100) ? 'Fully Used' : 'Available';
+                $status_class = ($usage_percentage >= 100) ? 'bg-secondary' : 'bg-success';
+                ?>
+                <span class="badge <?php echo $status_class; ?> text-white">
+                    <?php echo $status_text; ?>
+                </span>
+            </td>
+            <td class="text-center">
+                <?php echo number_format($used_days, 1) . ' / ' . number_format($total_days, 1); ?>
+                <?php if ($usage_percentage > 0 && $usage_percentage < 100): ?>
+                    <div class="progress mt-1" style="height: 5px;">
+                        <div class="progress-bar bg-<?php echo ($usage_percentage >= 100) ? 'secondary' : 'success'; ?>" 
+                             role="progressbar" 
+                             style="width: <?php echo min(100, $usage_percentage); ?>%" 
+                             aria-valuenow="<?php echo $usage_percentage; ?>" 
+                             aria-valuemin="0" 
+                             aria-valuemax="100">
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </td>
+            <td class="text-end">
+                <button class="btn btn-sm btn-outline-primary edit-overtime me-1" 
+                        data-id="<?php echo $request['id']; ?>"
+                        data-request='<?php echo htmlspecialchars(json_encode($request), ENT_QUOTES, 'UTF-8'); ?>'
+                        data-bs-toggle="tooltip" 
+                        title="Edit Request">
+                    <i class="bi bi-pencil"></i>
+                </button>
+                <?php if ($request['status'] === 'pending'): ?>
+                    <button class="btn btn-sm btn-outline-danger delete-overtime" 
+                            data-id="<?php echo $request['id']; ?>"
+                            data-bs-toggle="tooltip" 
+                            title="Delete Request">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                <?php endif; ?>
+            </td>
+        </tr>
+<?php 
+    endforeach; 
+else: 
+?>
+        <tr>
+            <td colspan="6" class="text-center py-4">
+                <div class="text-muted">No overtime requests found</div>
+                <small class="d-block mt-1">Click the "Add Overtime Details" button to create a new request</small>
+            </td>
+        </tr>
+<?php endif; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div class="card-footer bg-transparent border-top mt-auto">
+                                    <div class="d-flex justify-content-between align-items-center">
+                                        <small class="text-muted">Showing <?php echo min(10, count($overtime_requests)); ?> of <?php echo count($overtime_requests); ?> records</small>
+                                        <a href="#" class="btn btn-sm btn-outline-primary">
+                                            <i class="bi bi-arrow-right me-1"></i> View All
+                                        </a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Add more sections as needed -->
+                
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Offset Modal -->
+    <div class="modal fade" id="addOffsetModal" tabindex="-1" aria-labelledby="addOffsetModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="addOffsetModalLabel">New Offset Request</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <form id="offsetRequestForm" method="POST" action="">
+                    <input type="hidden" name="offset_submit" value="1">
+                    <div class="modal-body">
+                            <div class="mb-3">
+                                <label for="offsetActivity" class="form-label">Activity</label>
+                                <select class="form-select" id="offsetActivity" name="offset_activity" required>
+                                    <option value="" selected disabled>Select an activity with overtime</option>
+                                    <?php 
+                                    // Create a map of activities with available days for offset
+                                    $activities_with_availability = [];
+                                    foreach ($overtime_activities as $activity) {
+                                        $total_days = calculateWorkingDays($activity['start_date'], $activity['end_date']);
+                                        $used = $used_days[$activity['id']] ?? 0;
+                                        $available = max(0, $total_days - $used);
+                                        $activities_with_availability[$activity['id']] = [
+                                            'total_days' => $total_days,
+                                            'used' => $used,
+                                            'available' => $available
+                                        ];
+                                    }
+                                    
+                                    // Show all activities in the overtime request form
+                                    foreach ($activities as $activity): 
+                                        $activity_info = $activities_with_availability[$activity['id']] ?? [
+                                            'total_days' => calculateWorkingDays($activity['start_date'], $activity['end_date']),
+                                            'used' => 0,
+                                            'available' => 0
+                                        ];
+                                        $total_days = $activity_info['total_days'];
+                                        $used = $activity_info['used'];
+                                        $available = $activity_info['available'];
+                                        
+                                        // For the offset form, only show activities with available days
+                                        if ($available > 0): 
+                                    ?>
+                                        <option value="<?php echo $activity['id']; ?>" 
+                                                data-days="<?php echo $total_days; ?>"
+                                                data-used="<?php echo $used; ?>">
+                                            <?php echo htmlspecialchars($activity['title']); ?>
+                                            (Available: <?php echo $available; ?> days)
+                                        </option>
+                                    <?php 
+                                        endif;
+                                    endforeach; 
+                                    ?>
+                                </select>
+                                <div class="form-text">Select the activity to use overtime from</div>
+                            </div>
+                            <div class="mb-3">
+                                <label for="offsetDate" class="form-label">Date</label>
+                                <input type="date" class="form-control" id="offsetDate" name="offset_date" required>
+                            </div>
+                            
+
+                            <div class="mb-3">
+                                <label for="offsetReason" class="form-label">Reason</label>
+                                <textarea class="form-control" id="offsetReason" name="offset_reason" rows="3" required></textarea>
+                            </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Submit Request</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Overtime Modal -->
+    <div class="modal fade" id="addOvertimeModal" tabindex="-1" aria-labelledby="addOvertimeModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="addOvertimeModalLabel">New Overtime Request</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <?php if ($success_message): ?>
+                    <div class="alert alert-success"><?php echo htmlspecialchars($success_message); ?></div>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap JS and dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+        // Initialize when DOM is fully loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize tooltips
+            const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+            tooltipTriggerList.forEach(tooltipTriggerEl => {
+                new bootstrap.Tooltip(tooltipTriggerEl);
+            });
+            
+            // Handle edit form submission
+            const editForm = document.getElementById('editOvertimeForm');
+            if (editForm) {
+                editForm.addEventListener('submit', handleEditFormSubmit);
+            }
+            
+            // Handle delete offset requests
+            document.querySelectorAll('.delete-offset').forEach(button => {
+                button.addEventListener('click', handleDeleteOffset);
+            });
+            
+            // Handle offset form submission
+            const offsetForm = document.getElementById('addOffsetForm');
+            if (offsetForm) {
+                offsetForm.addEventListener('submit', handleOffsetFormSubmit);
+            }
+            
+            // Handle activity selection for offset form
+            const offsetActivitySelect = document.getElementById('offset_activity');
+            if (offsetActivitySelect) {
+                offsetActivitySelect.addEventListener('change', handleActivitySelect);
+            }
+            
+            // Initialize form validation
+            const forms = document.querySelectorAll('.needs-validation');
+            forms.forEach(form => {
+                form.addEventListener('submit', handleFormValidation);
+            });
+            
+            // Auto-dismiss alerts after 5 seconds
+            const alerts = document.querySelectorAll('.alert-dismissible');
+            alerts.forEach(alert => {
+                setTimeout(() => {
+                    const bsAlert = new bootstrap.Alert(alert);
+                    bsAlert.close();
+                }, 5000);
+            });
+        });
+        
+        // Form validation handler
+        function handleFormValidation(event) {
+            if (!this.checkValidity()) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            this.classList.add('was-validated');
+        }
+        
+        // Show alert message
+        function showAlert(type, message) {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${type} alert-dismissible fade show`;
+            alertDiv.role = 'alert';
+            alertDiv.innerHTML = `
+                ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            `;
+            
+            // Insert alert at the top of the main content
+            const mainContent = document.querySelector('.main-content');
+            if (mainContent) {
+                mainContent.insertBefore(alertDiv, mainContent.firstChild);
+            }
+            
+            // Auto-close after 5 seconds
+            setTimeout(() => {
+                const bsAlert = new bootstrap.Alert(alertDiv);
+                bsAlert.close();
+            }, 5000);
+        }
+        
+        // Handle edit form submission
+        async function handleEditFormSubmit(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const submitBtn = this.querySelector('button[type="submit"]');
+            const originalBtnText = submitBtn.innerHTML;
+            
+            try {
+                // Show loading state
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Updating...';
+                
+                const response = await fetch('update_overtime.php', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('success', data.message);
+                    // Close modal and reload after delay
+                    const modal = bootstrap.Modal.getInstance(document.getElementById('editOvertimeModal'));
+                    setTimeout(() => {
+                        if (modal) modal.hide();
+                        location.reload();
+                    }, 1500);
+                } else {
+                    showAlert('danger', data.message || 'An error occurred. Please try again.');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showAlert('danger', 'An error occurred. Please try again.');
+            } finally {
+                // Reset button state
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = originalBtnText;
+            }
+        }
+        
+        // Handle delete offset request
+        async function handleDeleteOffset(e) {
+            e.preventDefault();
+                        } else {
+                            throw new Error(data.message || 'Failed to delete offset request');
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        alert('Error: ' + error.message);
+                        this.innerHTML = originalContent;
+                        this.disabled = false;
+                    });
+                }
+            });
+        });
+
+        // Client-side validation
+        document.addEventListener('DOMContentLoaded', function() {
+            const form = document.getElementById('offsetRequestForm');
+            if (!form) return;
+            
+            form.addEventListener('submit', function(e) {
+                const submitBtn = form.querySelector('button[type="submit"]');
+                
+                // Disable submit button to prevent double submission
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Submitting...';
+                
+                // Client-side validation
+                const activity = form.querySelector('#offsetActivity');
+                const offsetDate = form.querySelector('#offsetDate');
+                const reason = form.querySelector('#offsetReason');
+                
+                if (!activity || !activity.value) {
+                    e.preventDefault();
+                    alert('Please select an activity');
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Submit Request';
+                    return false;
+                }
+                
+                if (!offsetDate || !offsetDate.value) {
+                    e.preventDefault();
+                    alert('Please select a date');
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Submit Request';
+                    return false;
+                }
+                
+                if (!reason || !reason.value.trim()) {
+                    e.preventDefault();
+                    alert('Please enter a reason');
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Submit Request';
+                    return false;
+                }
+                
+                // If we get here, form is valid and will be submitted
+                return true;
+            });
+        });
+        
+        // Initialize tooltips
+        var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+        var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+            return new bootstrap.Tooltip(tooltipTriggerEl);
+        });
+        
+        // Handle activity selection change in offset form
+        const offsetActivitySelect = document.getElementById('offsetActivity');
+        const offsetDaysInput = document.getElementById('offsetDays');
+        const availableDaysSpan = document.getElementById('availableDays');
+        const availableDaysValue = document.getElementById('availableDaysValue');
+        
+        if (offsetActivitySelect) {
+            offsetActivitySelect.addEventListener('change', function() {
+                const selectedOption = this.options[this.selectedIndex];
+                const totalDays = parseFloat(selectedOption.getAttribute('data-days')) || 0;
+                const usedDays = parseFloat(selectedOption.getAttribute('data-used')) || 0;
+                const availableDays = Math.max(0, totalDays - usedDays);
+                
+                // Update the available days display
+                availableDaysSpan.textContent = `Available: ${availableDays} day${availableDays !== 1 ? 's' : ''} (out of ${totalDays})`;
+                availableDaysValue.value = availableDays;
+                
+                // Update the max value of the days input
+                offsetDaysInput.max = availableDays;
+                
+                // Reset the value if it's more than available
+                if (parseFloat(offsetDaysInput.value) > availableDays) {
+                    offsetDaysInput.value = Math.min(1, availableDays);
+                }
+                
+                // Enable/disable the input based on available days
+                offsetDaysInput.disabled = availableDays <= 0;
+                if (availableDays <= 0) {
+                    availableDaysSpan.innerHTML = '<span class="text-danger">No available days for this activity</span>';
+                    offsetDaysInput.value = '0';
+                }
+            });
+        }
+        
+        // View offset details
+        function viewOffsetDetails(request) {
+            // Format the date
+            const offsetDate = new Date(request.offset_date);
+            const formattedDate = offsetDate.toLocaleDateString('en-US', { 
+                year: 'numeric', 
+                month: 'long', 
+                day: 'numeric',
+                weekday: 'long'
+            });
+            
+            // Create modal content
+            const modalContent = `
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Offset Request Details</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="row mb-3">
+                            <div class="col-md-6">
+                                <h6>Activity</h6>
+                                <p>${request.activity_title || 'N/A'}</p>
+                            </div>
+                            <div class="col-md-6">
+                                <h6>Offset Date</h6>
+                                <p>${formattedDate}</p>
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-md-6">
+                                <h6>Status</h6>
+                                <span class="badge ${request.status === 'approved' ? 'bg-success' : request.status === 'rejected' ? 'bg-danger' : 'bg-warning'}">
+                                    ${request.status.charAt(0).toUpperCase() + request.status.slice(1)}
+                                </span>
+                            </div>
+                            <div class="col-md-6">
+                                <h6>Requested On</h6>
+                                <p>${new Date(request.created_at).toLocaleString()}</p>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <h6>Reason</h6>
+                            <div class="border rounded p-3">
+                                ${request.reason ? request.reason.replace(/\n/g, '<br>') : 'No reason provided'}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    </div>
+                </div>
+            `;
+            
+            // Create and show modal
+            const modal = new bootstrap.Modal(document.createElement('div'));
+            modal._element.className = 'modal fade';
+            modal._element.innerHTML = modalContent;
+            document.body.appendChild(modal._element);
+            modal.show();
+            
+            // Clean up after modal is hidden
+            modal._element.addEventListener('hidden.bs.modal', function () {
+                document.body.removeChild(modal._element);
+            });
+        }
+        
+        // Cancel offset request
+        function cancelOffsetRequest(requestId) {
+            if (confirm('Are you sure you want to cancel this offset request?')) {
+                // You'll need to implement the AJAX call to cancel the request
+                fetch('cancel_offset_request.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `request_id=${requestId}`
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        location.reload();
+                    } else {
+                        alert('Failed to cancel request: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('An error occurred while processing your request');
+                });
+            }
+        }
+        
+        // Set default values for offset form
+        document.addEventListener('DOMContentLoaded', function() {
+            const today = new Date().toISOString().split('T')[0];
+            const offsetDateInput = document.getElementById('offsetDate');
+            if (offsetDateInput) {
+                offsetDateInput.value = today;
+                // Set minimum date to today
+                offsetDateInput.min = today;
+            }
+            
+            // Handle activity selection change
+            const activitySelect = document.getElementById('offsetActivity');
+            const availableDaysSpan = document.getElementById('availableDays');
+            
+            activitySelect.addEventListener('change', function() {
+                const selectedOption = this.options[this.selectedIndex];
+                const totalDays = parseFloat(selectedOption.getAttribute('data-days')) || 0;
+                const usedDays = parseFloat(selectedOption.getAttribute('data-used')) || 0;
+                const availableDays = Math.max(0, totalDays - usedDays);
+                
+                // Update the hidden input with total working days
+                totalWorkingDaysInput.value = totalDays;
+                
+                if (availableDays > 0) {
+                    availableDaysSpan.textContent = `Available: ${availableDays} day${availableDays !== 1 ? 's' : ''} (out of ${totalDays})`;
+                    availableDaysSpan.className = 'text-success';
+                } else {
+                    availableDaysSpan.textContent = 'No available days for this activity';
+                    availableDaysSpan.className = 'text-danger';
+                }
+            });
+
+            // Fetch activities from database and populate dropdown
+            fetch('/api/activities')
+                .then(response => response.json())
+                .then(data => {
+                    const activitySelect = document.getElementById('activity_id');
+                    data.forEach(activity => {
+                        const option = document.createElement('option');
+                        option.value = activity.id;
+                        option.text = activity.title;
+                        activitySelect.appendChild(option);
+                    });
+                })
+                .catch(error => console.error('Error fetching activities:', error));
+
+            // Form submission handlers
+            document.getElementById('offsetRequestForm').addEventListener('submit', function(e) {
+                e.preventDefault();
+{{ ... }}
+                alert('Offset request submitted successfully!');
+                var modal = bootstrap.Modal.getInstance(document.getElementById('addOffsetModal'));
+                modal.hide();
+                this.reset();
+            });
+            
+            document.getElementById('overtimeRequestForm').addEventListener('submit', function(e) {
+                // Client-side validation if needed
+                const activityId = document.getElementById('activity_id').value;
+                const overtimeDate = document.getElementById('overtimeDate').value;
+                
+                if (!activityId || !overtimeDate) {
+                    e.preventDefault();
+                    alert('Please fill in all required fields');
+                    return false;
+                }
+                
+                // Form will be submitted to the server
+                return true;
+            });
+        });
+    </script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize tooltips
+            var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+            var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+                return new bootstrap.Tooltip(tooltipTriggerEl);
+            });
+            
+            // Format dates using JavaScript
+            document.querySelectorAll('td:nth-child(3)').forEach(cell => {
+                if (cell.textContent.match(/\d{4}-\d{2}-\d{2}/)) {
+                    const date = new Date(cell.textContent);
+                    cell.textContent = date.toLocaleDateString('en-US', { 
+                        year: 'numeric', 
+                        month: 'long', 
+                        day: 'numeric' 
+                    });
+                }
+            });
+            
+            // Handle edit overtime request
+            document.querySelectorAll('.edit-overtime').forEach(button => {
+                button.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const request = JSON.parse(this.getAttribute('data-request'));
+                    
+                    // Populate the edit form with request data
+                    document.getElementById('editRequestId').value = request.id;
+                    document.getElementById('editActivity').value = request.activity_id;
+                    document.getElementById('editReason').value = request.reason || '';
+                    
+                    // Show the edit modal
+                    const editModal = new bootstrap.Modal(document.getElementById('editOvertimeModal'));
+                    editModal.show();
+                });
+            });
+            
+            // Handle delete overtime request
+            document.querySelectorAll('.delete-overtime').forEach(button => {
+                button.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const requestId = this.getAttribute('data-id');
+                    
+                    if (confirm('Are you sure you want to delete this overtime request? This action cannot be undone.')) {
+                        // Show loading state
+                        const originalContent = this.innerHTML;
+                        this.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Deleting...';
+                        this.disabled = true;
+                        
+                        // Send delete request
+                        fetch('delete_overtime.php', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                            },
+                            body: `request_id=${requestId}`
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.success) {
+                                // Remove the row from the table with a smooth fade out
+                                const row = this.closest('tr');
+                                row.style.transition = 'opacity 0.3s';
+                                row.style.opacity = '0';
+                                setTimeout(() => {
+                                    row.remove();
+                                }, 300);
+                            } else {
+                                alert('Failed to delete overtime request: ' + (data.message || 'Unknown error'));
+                                this.innerHTML = originalContent;
+                                this.disabled = false;
+                            }
+                        })
+                        .catch(error => {
+                            console.error('Error:', error);
+                            alert('An error occurred while deleting the request');
+                            this.innerHTML = originalContent;
+                            this.disabled = false;
+                        });
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>
